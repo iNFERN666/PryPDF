@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
-*_page0.png
+*_page*.png
 _test_out*.pdf
 _manual_test.pdf
 packing_list_updated*.pdf
+*.pdf

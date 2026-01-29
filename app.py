@@ -70,25 +70,39 @@ def _find_header_center(
 
 def _draw_text(page: fitz.Page, span: Dict, text: str) -> None:
     x0, y0, x1, y1 = span["bbox"]
-    height = y1 - y0
-    pad_y = max(0.3, height * 0.05)
-    rect = fitz.Rect(x0, y0 + pad_y, x1, y1 - pad_y)
-    page.draw_rect(rect, color=None, fill=(1, 1, 1))
-
     fontname = span.get("font", "helv")
     fontsize = span.get("size", 10)
+    origin = span.get("origin", (x0, y1))
+    asc = span.get("ascender", 0.8)
+    desc = span.get("descender", -0.2)
+
     try:
-        text_width = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+        new_width = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+        old_width = fitz.get_text_length(
+            span.get("text", ""), fontname=fontname, fontsize=fontsize
+        )
         use_font = fontname
     except Exception:
         use_font = "helv"
-        text_width = fitz.get_text_length(text, fontname=use_font, fontsize=fontsize)
+        new_width = fitz.get_text_length(text, fontname=use_font, fontsize=fontsize)
+        old_width = fitz.get_text_length(
+            span.get("text", ""), fontname=use_font, fontsize=fontsize
+        )
 
-    origin = span.get("origin", (x0, y1))
-    x = x1 - text_width
-    y = origin[1]
+    max_width = max(new_width, old_width)
+    x_end = x1
+    x_start = x_end - max_width
+    y_baseline = origin[1]
+    y_top = y_baseline - fontsize * asc
+    y_bottom = y_baseline - fontsize * desc
+
+    pad_x = max(0.2, max_width * 0.02)
+    pad_y = max(0.2, (y_bottom - y_top) * 0.08)
+    rect = fitz.Rect(x_start - pad_x, y_top - pad_y, x_end + pad_x, y_bottom + pad_y)
+    page.draw_rect(rect, color=None, fill=(1, 1, 1))
+
     page.insert_text(
-        (x, y),
+        (x_end - new_width, y_baseline),
         text,
         fontname=use_font,
         fontsize=fontsize,
@@ -122,14 +136,41 @@ def _replace_by_column(
     header_bottom: Optional[float],
 ) -> int:
     replaced = 0
-    if net_center is not None:
-        split = (gross_center + net_center) / 2
-        gross_is_left = gross_center < net_center
-    else:
-        split = None
-        gross_is_left = True
-        tol = max(20, col_width * 1.2)
-    min_y = (header_bottom or 0.0) + 2.0
+    if net_center is None:
+        return 0
+    split = (gross_center + net_center) / 2
+    gross_is_left = gross_center < net_center
+    min_y = (header_bottom or 0.0) + 2.0 if header_bottom else None
+
+    if min_y is None:
+        # derive a safe top boundary from first gross-column KG occurrence
+        candidate_top = None
+        for line_text, spans in lines:
+            lower = line_text.lower()
+            if "gross" in lower and "weight" in lower:
+                continue
+            if "net" in lower and "weight" in lower:
+                continue
+            for idx, span in enumerate(spans):
+                x0, _, x1, _ = span["bbox"]
+                center = (x0 + x1) / 2
+                if gross_is_left and center >= split:
+                    continue
+                if not gross_is_left and center <= split:
+                    continue
+                text = span.get("text", "")
+                if not text.strip():
+                    continue
+                is_kg = KG_PATTERN.search(text)
+                if not is_kg and NUMBER_PATTERN.match(text.strip()):
+                    next_span = spans[idx + 1] if idx + 1 < len(spans) else None
+                    if not (next_span and "kg" in next_span.get("text", "").lower()):
+                        continue
+                y_top = span["bbox"][1]
+                if candidate_top is None or y_top < candidate_top:
+                    candidate_top = y_top
+        if candidate_top is not None:
+            min_y = candidate_top - 1.0
 
     for line_text, spans in lines:
         lower = line_text.lower()
@@ -141,15 +182,11 @@ def _replace_by_column(
         for idx, span in enumerate(spans):
             x0, _, x1, _ = span["bbox"]
             center = (x0 + x1) / 2
-            if split is not None:
-                if gross_is_left and center >= split:
-                    continue
-                if not gross_is_left and center <= split:
-                    continue
-            else:
-                if abs(center - gross_center) > tol:
-                    continue
-            if span["bbox"][1] <= min_y:
+            if gross_is_left and center >= split:
+                continue
+            if not gross_is_left and center <= split:
+                continue
+            if min_y is not None and span["bbox"][1] <= min_y:
                 continue
 
             text = span.get("text", "")
@@ -208,24 +245,64 @@ def _replace_by_first_kg_in_line(
     return replaced
 
 
-def _replace_in_page(page: fitz.Page, add_kg: float) -> int:
+def _replace_in_page(
+    page: fitz.Page,
+    add_kg: float,
+    cached: Dict[str, Optional[float]],
+) -> Tuple[int, Dict[str, Optional[float]]]:
     lines = _get_lines(page)
     gross_info = _find_header_center(lines, ("gross", "weight"))
     net_info = _find_header_center(lines, ("net", "weight"))
-    if gross_info:
+
+    if gross_info and net_info:
         gross_center, col_width, _, gross_bottom = gross_info
-        net_center = net_info[0] if net_info else None
-        return _replace_by_column(
-            page, lines, add_kg, gross_center, net_center, col_width, gross_bottom
+        cached["gross_center"] = gross_center
+        cached["net_center"] = net_info[0]
+        cached["col_width"] = col_width
+        cached["header_bottom"] = gross_bottom
+
+        return (
+            _replace_by_column(
+                page,
+                lines,
+                add_kg,
+                gross_center,
+                cached["net_center"],
+                col_width,
+                gross_bottom,
+            ),
+            cached,
         )
-    return _replace_by_first_kg_in_line(page, lines, add_kg)
+
+    if cached.get("gross_center") is not None and cached.get("net_center") is not None:
+        return (
+            _replace_by_column(
+                page,
+                lines,
+                add_kg,
+                cached["gross_center"],
+                cached["net_center"],
+                cached.get("col_width") or 40,
+                None,
+            ),
+            cached,
+        )
+
+    return 0, cached
 
 
 def process_pdf(data: bytes, add_kg: float) -> Tuple[bytes, int]:
     doc = fitz.open(stream=data, filetype="pdf")
     total_replaced = 0
+    cached: Dict[str, Optional[float]] = {
+        "gross_center": None,
+        "net_center": None,
+        "col_width": None,
+        "header_bottom": None,
+    }
     for page in doc:
-        total_replaced += _replace_in_page(page, add_kg)
+        replaced, cached = _replace_in_page(page, add_kg, cached)
+        total_replaced += replaced
 
     out = io.BytesIO()
     doc.save(out, deflate=True, clean=True)
