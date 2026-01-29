@@ -2,5 +2,5 @@ services:
   prypdf:
     build: .
     ports:
-      - "8501:8501"
+      - "8005:8501"
     restart: unless-stopped
