@@ -1,5 +1,6 @@
 import io
 import re
+import zipfile
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
@@ -327,29 +328,61 @@ def run_app() -> None:
     )
 
     add_kg = st.number_input("Adaos (KG)", min_value=0.0, step=0.001, format="%.3f")
-    file = st.file_uploader("Încarcă PDF", type=["pdf"])
+    files = st.file_uploader("Încarcă PDF", type=["pdf"], accept_multiple_files=True)
 
-    if file and st.button("Procesează"):
-        if file.type != "application/pdf":
-            st.error("Te rog încarcă un fișier PDF valid.")
-            return
-        if getattr(file, "size", 0) > MAX_FILE_MB * 1024 * 1024:
-            st.error(f"Fișierul depășește limita de {MAX_FILE_MB} MB.")
-            return
-        data = file.read()
-        with st.spinner("Procesez PDF-ul..."):
-            try:
-                output, replaced = process_pdf(data, add_kg)
-            except ValueError as exc:
-                st.error(str(exc))
-                return
-        st.success(f"Gata. Am actualizat {replaced} valori de Gross Weight.")
-        st.download_button(
-            "Descarcă PDF modificat",
-            data=output,
-            file_name=Path(file.name).name,
-            mime="application/pdf",
-        )
+    if files and st.button("Procesează"):
+        results: List[Tuple[str, bytes, int]] = []
+        errors: List[str] = []
+
+        with st.spinner("Procesez PDF-urile..."):
+            for file in files:
+                if file.type != "application/pdf":
+                    errors.append(f"{file.name}: fișierul nu este PDF valid.")
+                    continue
+                if getattr(file, "size", 0) > MAX_FILE_MB * 1024 * 1024:
+                    errors.append(
+                        f"{file.name}: depășește limita de {MAX_FILE_MB} MB."
+                    )
+                    continue
+
+                data = file.read()
+                try:
+                    output, replaced = process_pdf(data, add_kg)
+                except ValueError as exc:
+                    errors.append(f"{file.name}: {exc}")
+                    continue
+
+                results.append((Path(file.name).name, output, replaced))
+
+        if errors:
+            for msg in errors:
+                st.error(msg)
+
+        if results:
+            total = sum(r[2] for r in results)
+            st.success(
+                f"Gata. Am actualizat {total} valori de Gross Weight în {len(results)} fișier(e)."
+            )
+
+            if len(results) > 1:
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for name, data, _ in results:
+                        zf.writestr(name, data)
+                st.download_button(
+                    "Descarcă toate (ZIP)",
+                    data=zip_buffer.getvalue(),
+                    file_name="packing_list_updated.zip",
+                    mime="application/zip",
+                )
+
+            for name, data, _ in results:
+                st.download_button(
+                    f"Descarcă {name}",
+                    data=data,
+                    file_name=name,
+                    mime="application/pdf",
+                )
 
     st.caption(
         "Notă: Pentru a păstra aspectul paginii, aplicația rescrie doar valorile "
