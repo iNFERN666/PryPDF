@@ -374,14 +374,16 @@ def run_app() -> None:
                     data=zip_buffer.getvalue(),
                     file_name="packing_list_updated.zip",
                     mime="application/zip",
+                    key="download_zip_all",
                 )
 
-            for name, data, _ in results:
+            for idx, (name, data, _) in enumerate(results):
                 st.download_button(
                     f"Descarcă {name}",
                     data=data,
                     file_name=name,
                     mime="application/pdf",
+                    key=f"download_pdf_{idx}_{name}",
                 )
 
     st.caption(
