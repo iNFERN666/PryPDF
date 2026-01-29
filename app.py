@@ -42,52 +42,58 @@ def _get_lines(page: fitz.Page) -> List[Tuple[str, List[Dict]]]:
     return lines
 
 
-def _gross_column_info(lines: List[Tuple[str, List[Dict]]]) -> Optional[Tuple[float, float]]:
+def _find_header_center(
+    lines: List[Tuple[str, List[Dict]]], keywords: Tuple[str, str]
+) -> Optional[Tuple[float, float, float, float]]:
     for line_text, spans in lines:
         lower = line_text.lower()
-        if "gross" in lower and "weight" in lower:
+        if all(k in lower for k in keywords):
             x0s = []
             x1s = []
+            y1s = []
             for span in spans:
                 txt = span.get("text", "").strip().lower()
-                if "gross" in txt or "weight" in txt:
-                    x0, _, x1, _ = span["bbox"]
+                if any(k in txt for k in keywords):
+                    x0, _, x1, y1 = span["bbox"]
                     x0s.append(x0)
                     x1s.append(x1)
+                    y1s.append(y1)
             if x0s and x1s:
                 left = min(x0s)
                 right = max(x1s)
                 center = (left + right) / 2
                 width = max(right - left, 40)
-                return center, width
+                bottom = max(y1s) if y1s else 0.0
+                return center, width, left, bottom
     return None
 
 
 def _draw_text(page: fitz.Page, span: Dict, text: str) -> None:
     x0, y0, x1, y1 = span["bbox"]
-    rect = fitz.Rect(x0, y0, x1, y1)
+    height = y1 - y0
+    pad_y = max(0.3, height * 0.05)
+    rect = fitz.Rect(x0, y0 + pad_y, x1, y1 - pad_y)
     page.draw_rect(rect, color=None, fill=(1, 1, 1))
 
     fontname = span.get("font", "helv")
     fontsize = span.get("size", 10)
     try:
-        page.insert_textbox(
-            rect,
-            text,
-            fontname=fontname,
-            fontsize=fontsize,
-            color=(0, 0, 0),
-            align=fitz.TEXT_ALIGN_RIGHT,
-        )
+        text_width = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+        use_font = fontname
     except Exception:
-        page.insert_textbox(
-            rect,
-            text,
-            fontname="helv",
-            fontsize=fontsize,
-            color=(0, 0, 0),
-            align=fitz.TEXT_ALIGN_RIGHT,
-        )
+        use_font = "helv"
+        text_width = fitz.get_text_length(text, fontname=use_font, fontsize=fontsize)
+
+    origin = span.get("origin", (x0, y1))
+    x = x1 - text_width
+    y = origin[1]
+    page.insert_text(
+        (x, y),
+        text,
+        fontname=use_font,
+        fontsize=fontsize,
+        color=(0, 0, 0),
+    )
 
 
 def _update_span_number(span: Dict, add_kg: float) -> Optional[str]:
@@ -110,11 +116,20 @@ def _replace_by_column(
     page: fitz.Page,
     lines: List[Tuple[str, List[Dict]]],
     add_kg: float,
-    col_center: float,
+    gross_center: float,
+    net_center: Optional[float],
     col_width: float,
+    header_bottom: Optional[float],
 ) -> int:
     replaced = 0
-    tol = max(30, col_width * 1.5)
+    if net_center is not None:
+        split = (gross_center + net_center) / 2
+        gross_is_left = gross_center < net_center
+    else:
+        split = None
+        gross_is_left = True
+        tol = max(20, col_width * 1.2)
+    min_y = (header_bottom or 0.0) + 2.0
 
     for line_text, spans in lines:
         lower = line_text.lower()
@@ -126,7 +141,15 @@ def _replace_by_column(
         for idx, span in enumerate(spans):
             x0, _, x1, _ = span["bbox"]
             center = (x0 + x1) / 2
-            if abs(center - col_center) > tol:
+            if split is not None:
+                if gross_is_left and center >= split:
+                    continue
+                if not gross_is_left and center <= split:
+                    continue
+            else:
+                if abs(center - gross_center) > tol:
+                    continue
+            if span["bbox"][1] <= min_y:
                 continue
 
             text = span.get("text", "")
@@ -187,10 +210,14 @@ def _replace_by_first_kg_in_line(
 
 def _replace_in_page(page: fitz.Page, add_kg: float) -> int:
     lines = _get_lines(page)
-    col_info = _gross_column_info(lines)
-    if col_info:
-        col_center, col_width = col_info
-        return _replace_by_column(page, lines, add_kg, col_center, col_width)
+    gross_info = _find_header_center(lines, ("gross", "weight"))
+    net_info = _find_header_center(lines, ("net", "weight"))
+    if gross_info:
+        gross_center, col_width, _, gross_bottom = gross_info
+        net_center = net_info[0] if net_info else None
+        return _replace_by_column(
+            page, lines, add_kg, gross_center, net_center, col_width, gross_bottom
+        )
     return _replace_by_first_kg_in_line(page, lines, add_kg)
 
 
@@ -206,30 +233,35 @@ def process_pdf(data: bytes, add_kg: float) -> Tuple[bytes, int]:
     return out.getvalue(), total_replaced
 
 
-st.set_page_config(page_title="PryPDF", layout="centered")
+def run_app() -> None:
+    st.set_page_config(page_title="PryPDF", layout="centered")
 
-st.title("PryPDF – Gross Weight Updater")
-st.write(
-    "Încarcă un PDF (Delivery Note / Packing List), introduce adaosul în KG "
-    "și primești PDF-ul modificat cu Gross Weight incrementat."
-)
-
-add_kg = st.number_input("Adaos (KG)", min_value=0.0, step=0.001, format="%.3f")
-file = st.file_uploader("Încarcă PDF", type=["pdf"])
-
-if file and st.button("Procesează"):
-    data = file.read()
-    with st.spinner("Procesez PDF-ul..."):
-        output, replaced = process_pdf(data, add_kg)
-    st.success(f"Gata. Am actualizat {replaced} valori de Gross Weight.")
-    st.download_button(
-        "Descarcă PDF modificat",
-        data=output,
-        file_name="packing_list_updated.pdf",
-        mime="application/pdf",
+    st.title("PryPDF – Gross Weight Updater")
+    st.write(
+        "Încarcă un PDF (Delivery Note / Packing List), introduce adaosul în KG "
+        "și primești PDF-ul modificat cu Gross Weight incrementat."
     )
 
-st.caption(
-    "Notă: Pentru a păstra aspectul paginii, aplicația rescrie doar valorile "
-    "Gross Weight în același loc, cu aliniere la dreapta."
-)
+    add_kg = st.number_input("Adaos (KG)", min_value=0.0, step=0.001, format="%.3f")
+    file = st.file_uploader("Încarcă PDF", type=["pdf"])
+
+    if file and st.button("Procesează"):
+        data = file.read()
+        with st.spinner("Procesez PDF-ul..."):
+            output, replaced = process_pdf(data, add_kg)
+        st.success(f"Gata. Am actualizat {replaced} valori de Gross Weight.")
+        st.download_button(
+            "Descarcă PDF modificat",
+            data=output,
+            file_name="packing_list_updated.pdf",
+            mime="application/pdf",
+        )
+
+    st.caption(
+        "Notă: Pentru a păstra aspectul paginii, aplicația rescrie doar valorile "
+        "Gross Weight în același loc, cu aliniere la dreapta."
+    )
+
+
+if __name__ == "__main__":
+    run_app()

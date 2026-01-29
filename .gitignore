@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*_page0.png
+_test_out*.pdf
+_manual_test.pdf
+packing_list_updated*.pdf
